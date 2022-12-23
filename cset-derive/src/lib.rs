@@ -125,7 +125,15 @@ fn create_draft_struct(struct_ident: &Ident, fields: &[UndoableStructField]) -> 
         let dirty_checker = create_dirty_check_ident(ident);
         let resetter = create_resetter_ident(ident);
 
+        let struct_field = format!("[`{struct_ident}::{ident}`]");
+        let commit_method = "[`Self::commit()`]".to_string();
+        let getter_doc = format!("Gets the value for {struct_field}.\n\nReturns a reference to the draft value if set, or falls through to the underlying struct's value.");
+        let setter_doc = format!("Set a draft value for {struct_field}.\n\nThis method does not overwrite the existing value in the underlying struct. To apply the change to the underlying struct, call {commit_method}.");
+        let dirty_doc = format!("Returns whether {struct_field} would be changed by this draft if {commit_method} was called.");
+        let reset_doc = format!("Clear any draft changes made to {struct_field}.");
+
         quote! {
+            #[doc = #getter_doc]
             pub fn #getter(&self) -> &#ty {
                 match &self.#ident {
                     ::cset::DraftField::Unchanged => &self.__backing.#ident,
@@ -133,15 +141,18 @@ fn create_draft_struct(struct_ident: &Ident, fields: &[UndoableStructField]) -> 
                 }
             }
 
+            #[doc = #setter_doc]
             pub fn #setter(mut self, #ident: #ty) -> Self {
                 self.#ident = ::cset::DraftField::Changed(#ident);
                 self
             }
 
+            #[doc = #dirty_doc]
             pub fn #dirty_checker(&self) -> bool {
                 matches!(&self.#ident, ::cset::DraftField::Changed(_))
             }
 
+            #[doc = #reset_doc]
             pub fn #resetter(&mut self) -> Option<#ty> {
                 match ::std::mem::replace(&mut self.#ident, ::cset::DraftField::Unchanged) {
                     ::cset::DraftField::Changed(new_value) => {
@@ -189,10 +200,13 @@ fn create_draft_struct(struct_ident: &Ident, fields: &[UndoableStructField]) -> 
         impl<'a> #draft_ident<'a> {
             #(#draft_field_fns)*
 
+            /// Returns true if the draft will modify the underlying struct if
+            /// committed.
             pub fn is_dirty(&self) -> bool {
                 #(#draft_change_checkers)||*
             }
 
+            /// Clear all updates to changed fields.
             pub fn reset(&mut self) {
                 #(#draft_resetters;)*
             }
