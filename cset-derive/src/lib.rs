@@ -54,7 +54,7 @@ fn derive_struct_undo(input: &DeriveInput, data: &DataStruct) -> TokenStream {
     let draft_ident = create_draft_ident(struct_ident);
     let draft_fields = fields.iter().map(|field| {
         let UndoableStructField { ident, .. } = field;
-        quote!(#ident: DraftField::Unchanged)
+        quote!(#ident: ::cset::DraftField::Unchanged)
     });
 
     let changesetters = fields.iter().map(|field| {
@@ -65,7 +65,7 @@ fn derive_struct_undo(input: &DeriveInput, data: &DataStruct) -> TokenStream {
                 let new_value = change.take_old_value().downcast::<#ty>().unwrap();
                 let old_value = ::std::mem::replace(&mut self.#ident, *new_value);
 
-                changes.push(Change::new(
+                changes.push(::cset::Change::new(
                     #id,
                     Box::new(old_value),
                 ));
@@ -74,38 +74,34 @@ fn derive_struct_undo(input: &DeriveInput, data: &DataStruct) -> TokenStream {
     });
 
     quote! {
-        const _: () = {
-            use ::cset::*;
+        impl<'a> Trackable<'a> for #struct_ident {
+            type Draft = #draft_ident<'a>;
 
-            impl<'a> Trackable<'a> for #struct_ident {
-                type Draft = #draft_ident<'a>;
-
-                fn edit(&'a mut self) -> #draft_ident<'a> {
-                    #draft_ident {
-                        __backing: self,
-                        #(#draft_fields,)*
-                    }
-                }
-
-                fn apply_changeset(&mut self, changeset: ChangeSet) -> ChangeSet {
-                    assert_eq!(changeset.target_type(), ::std::any::TypeId::of::<Self>());
-
-                    let mut changes = Vec::new();
-
-                    for change in changeset.take_changes() {
-                        match change.field() {
-                            #(#changesetters),*
-                            _ => unreachable!("unknown field in change"),
-                        }
-                    }
-
-                    ChangeSet::new(
-                        ::std::any::TypeId::of::<Self>(),
-                        changes,
-                    )
+            fn edit(&'a mut self) -> #draft_ident<'a> {
+                #draft_ident {
+                    __backing: self,
+                    #(#draft_fields,)*
                 }
             }
-        };
+
+            fn apply_changeset(&mut self, changeset: ::cset::ChangeSet) -> ::cset::ChangeSet {
+                assert_eq!(changeset.target_type(), ::std::any::TypeId::of::<Self>());
+
+                let mut changes = Vec::new();
+
+                for change in changeset.take_changes() {
+                    match change.field() {
+                        #(#changesetters),*
+                        _ => unreachable!("unknown field in change"),
+                    }
+                }
+
+                ::cset::ChangeSet::new(
+                    ::std::any::TypeId::of::<Self>(),
+                    changes,
+                )
+            }
+        }
 
         #draft_struct
     }
@@ -132,23 +128,23 @@ fn create_draft_struct(struct_ident: &Ident, fields: &[UndoableStructField]) -> 
         quote! {
             pub fn #getter(&self) -> &#ty {
                 match &self.#ident {
-                    DraftField::Unchanged => &self.__backing.#ident,
-                    DraftField::Changed(new_val) => &new_val,
+                    ::cset::DraftField::Unchanged => &self.__backing.#ident,
+                    ::cset::DraftField::Changed(new_val) => &new_val,
                 }
             }
 
             pub fn #setter(mut self, #ident: #ty) -> Self {
-                self.#ident = DraftField::Changed(#ident);
+                self.#ident = ::cset::DraftField::Changed(#ident);
                 self
             }
 
             pub fn #dirty_checker(&self) -> bool {
-                matches!(&self.#ident, DraftField::Changed(_))
+                matches!(&self.#ident, ::cset::DraftField::Changed(_))
             }
 
             pub fn #resetter(&mut self) -> Option<#ty> {
-                match ::std::mem::replace(&mut self.#ident, DraftField::Unchanged) {
-                    DraftField::Changed(new_value) => {
+                match ::std::mem::replace(&mut self.#ident, ::cset::DraftField::Unchanged) {
+                    ::cset::DraftField::Changed(new_value) => {
                         Some(new_value)
                     }
                     _ => None,
@@ -173,10 +169,10 @@ fn create_draft_struct(struct_ident: &Ident, fields: &[UndoableStructField]) -> 
         let UndoableStructField { id, ident, .. } = field;
 
         quote! {
-            if let DraftField::Changed(#ident) = self.#ident {
+            if let ::cset::DraftField::Changed(#ident) = self.#ident {
                 let old_value = ::std::mem::replace(&mut self.__backing.#ident, #ident);
 
-                changes.push(Change::new(
+                changes.push(::cset::Change::new(
                     #id,
                     Box::new(old_value),
                 ))
@@ -190,34 +186,30 @@ fn create_draft_struct(struct_ident: &Ident, fields: &[UndoableStructField]) -> 
             #(#draft_fields,)*
         }
 
-        const _: () = {
-            use ::cset::*;
+        impl<'a> #draft_ident<'a> {
+            #(#draft_field_fns)*
 
-            impl<'a> #draft_ident<'a> {
-                #(#draft_field_fns)*
-
-                pub fn is_dirty(&self) -> bool {
-                    #(#draft_change_checkers)||*
-                }
-
-                pub fn reset(&mut self) {
-                    #(#draft_resetters;)*
-                }
+            pub fn is_dirty(&self) -> bool {
+                #(#draft_change_checkers)||*
             }
 
-            impl<'a> Draft<'a> for #draft_ident<'a> {
-                fn commit(mut self) -> ChangeSet {
-                    let mut changes: Vec<Change> = Vec::new();
-
-                    #(#draft_field_commit)*
-
-                    ChangeSet::new(
-                        ::std::any::TypeId::of::<#struct_ident>(),
-                        changes
-                    )
-                }
+            pub fn reset(&mut self) {
+                #(#draft_resetters;)*
             }
-        };
+        }
+
+        impl<'a> Draft<'a> for #draft_ident<'a> {
+            fn commit(mut self) -> ChangeSet {
+                let mut changes = Vec::new();
+
+                #(#draft_field_commit)*
+
+                ChangeSet::new(
+                    ::std::any::TypeId::of::<#struct_ident>(),
+                    changes
+                )
+            }
+        }
     }
 }
 
