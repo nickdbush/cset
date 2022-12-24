@@ -1,13 +1,13 @@
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, DataStruct, DeriveInput, Type};
+use syn::{parse_macro_input, Attribute, DataStruct, DeriveInput, Error, Meta, NestedMeta, Type};
 
-#[proc_macro_derive(Track)]
+#[proc_macro_derive(Track, attributes(track))]
 pub fn macro_entry(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
     let expanded = match &input.data {
-        syn::Data::Struct(data) => derive_struct_undo(&input, data),
+        syn::Data::Struct(data) => derive_tracked_struct(&input, data),
         syn::Data::Enum(data) => {
             syn::Error::new_spanned(data.enum_token, "Cannot derive Undo for enums")
                 .into_compile_error()
@@ -21,13 +21,14 @@ pub fn macro_entry(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     expanded.into()
 }
 
-struct UndoableStructField {
-    id: String,
+struct TrackedField {
+    index: usize,
     ident: Ident,
     ty: Type,
+    flattened_ident: Option<Ident>,
 }
 
-fn derive_struct_undo(input: &DeriveInput, data: &DataStruct) -> TokenStream {
+fn derive_tracked_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
     let struct_ident = &input.ident;
 
     for field in &data.fields {
@@ -40,66 +41,119 @@ fn derive_struct_undo(input: &DeriveInput, data: &DataStruct) -> TokenStream {
     let fields = data
         .fields
         .iter()
-        .map(|field| {
+        .enumerate()
+        .map(|(index, field)| {
             let ident = field.ident.clone().unwrap();
-            UndoableStructField {
-                id: ident.to_string(),
+            let is_flattened = field.attrs.iter().any(|attr| {
+                get_meta_items(attr).unwrap().iter().any(|meta| match meta {
+                    NestedMeta::Meta(Meta::Path(path)) => path.is_ident("flatten"),
+                    _ => false,
+                })
+            });
+            
+            let ty = field.ty.clone();
+            let flattened_ident = if is_flattened {
+                Some(flattened_struct_ident(&ty))
+            } else {
+                None
+            };
+
+            TrackedField {
+                index,
                 ident,
                 ty: field.ty.clone(),
+                flattened_ident,
             }
         })
         .collect::<Vec<_>>();
 
-    let draft_struct = create_draft_struct(struct_ident, &fields[..]);
+    let draft_struct = derive_draft_struct(struct_ident, &fields[..]);
     let draft_ident = create_draft_ident(struct_ident);
-    let draft_fields = fields.iter().map(|field| {
-        let UndoableStructField { ident, .. } = field;
-        quote!(#ident: ::cset::DraftField::Unchanged)
-    });
+    let draft_setters = fields.iter().map(|field| {
+        let TrackedField {
+            ident,
+            flattened_ident,
+            ..
+        } = field;
 
-    let changesetters = fields.iter().map(|field| {
-        let UndoableStructField { id, ident, ty } = field;
-
-        quote! {
-            #id => {
-                let new_value = change.take_old_value().downcast::<#ty>().unwrap();
-                let old_value = ::std::mem::replace(&mut self.#ident, *new_value);
-
-                changes.push(::cset::Change::new(
-                    #id,
-                    Box::new(old_value),
-                ));
-            }
+        if flattened_ident.is_some() {
+            quote!(#ident: self.#ident.edit())
+        } else {
+            quote!(#ident: ::cset::DraftField::new(&mut self.#ident))
         }
     });
 
-    quote! {
-        impl<'a> Trackable<'a> for #struct_ident {
-            type Draft = #draft_ident<'a>;
+    let apply_value_fields = fields
+        .iter()
+        .filter(|field| field.flattened_ident.is_none())
+        .map(|field| {
+            let TrackedField {
+                index, ident, ty, ..
+            } = field;
 
-            fn edit(&'a mut self) -> #draft_ident<'a> {
+            quote! {
+                #index => {
+                    let new_value = *value.downcast::<#ty>().unwrap();
+                    let old_value = ::std::mem::replace(&mut self.#ident, new_value);
+                    reverse_changes.push(::cset::Change {
+                        field_id: change.field_id,
+                        value: ::cset::ChangeValue::Value(::std::boxed::Box::new(old_value)),
+                    });
+                }
+            }
+        });
+
+    let apply_changeset_fields = fields
+        .iter()
+        .filter(|field| field.flattened_ident.is_some())
+        .map(|field| {
+            let TrackedField {
+                index, ident, ..
+            } = field;
+
+            quote! {
+                #index => {
+                    let reverse_change = self.#ident.apply_impl(field_changes, depth + 1);
+                    reverse_changes.push(::cset::Change {
+                        field_id: change.field_id,
+                        value: ::cset::ChangeValue::ChangeSet(reverse_change),
+                    });
+                }
+            }
+        });
+
+    quote! {
+        impl #struct_ident {
+            pub fn edit(&mut self) -> #draft_ident {
                 #draft_ident {
-                    __backing: self,
-                    #(#draft_fields,)*
+                    #(#draft_setters,)*
                 }
             }
 
-            fn apply_changeset(&mut self, changeset: ::cset::ChangeSet) -> ::cset::ChangeSet {
-                assert_eq!(changeset.target_type(), ::std::any::TypeId::of::<Self>());
+            pub fn apply(&mut self, changeset: ::cset::ChangeSet) -> ::cset::ChangeSet {
+                self.apply_impl(changeset, 0)
+            }
 
-                let mut changes = Vec::new();
+            fn apply_impl(&mut self, changeset: ::cset::ChangeSet, depth: usize) -> ::cset::ChangeSet {
+                assert!(changeset.for_type::<#struct_ident>());
+                let mut reverse_changes = Vec::new();
 
-                for change in changeset.take_changes() {
-                    match change.field() {
-                        #(#changesetters),*
-                        _ => unreachable!("unknown field in change"),
-                    }
+                for change in changeset.changes {
+                    let field_index = change.field_id.field_index(depth);
+
+                    match change.value {
+                        ::cset::ChangeValue::Value(value) => match field_index {
+                            #(#apply_value_fields,)*
+                            _ => unreachable!(),
+                        },
+                        ::cset::ChangeValue::ChangeSet(field_changes) => match field_index {
+                            #(#apply_changeset_fields,)*
+                            _ => unreachable!(),
+                        },
+                    };
                 }
 
-                ::cset::ChangeSet::new(
-                    ::std::any::TypeId::of::<Self>(),
-                    changes,
-                )
+                ::cset::ChangeSet::new::<#struct_ident>(reverse_changes)
             }
         }
 
@@ -107,98 +161,109 @@ fn derive_struct_undo(input: &DeriveInput, data: &DataStruct) -> TokenStream {
     }
 }
 
-fn create_draft_struct(struct_ident: &Ident, fields: &[UndoableStructField]) -> TokenStream {
+fn derive_draft_struct(struct_ident: &Ident, fields: &[TrackedField]) -> TokenStream {
     let draft_ident = create_draft_ident(struct_ident);
 
     let draft_fields = fields.iter().map(|field| {
-        let UndoableStructField { ident, ty, .. } = field;
+        let TrackedField { ident, ty, flattened_ident, .. } = field;
 
-        quote! {
-            #ident: ::cset::DraftField::<#ty>
+        if let Some(flattened_ident) = flattened_ident {
+            let draft_ident = create_draft_ident(flattened_ident);
+            quote!(#ident: #draft_ident<'b>)
+        } else {
+            quote!(#ident: ::cset::DraftField::<'b, #ty>)
         }
     });
 
-    let draft_field_fns = fields.iter().map(|field| {
-        let UndoableStructField { ident, ty, .. } = field;
-        let getter = format_ident!("get_{ident}");
-        let setter = format_ident!("set_{ident}");
+    let field_api_fns = fields.iter().map(|field| {
+        let TrackedField { ident, ty, flattened_ident, .. } = field;
         let dirty_checker = create_dirty_check_ident(ident);
         let resetter = create_resetter_ident(ident);
+                
+        if let Some(flattened_ident) = flattened_ident {
+            let editor = format_ident!("edit_{ident}");
+            let flattened_draft_ident = create_draft_ident(flattened_ident); 
+            quote! {
+                pub fn #editor(&mut self) -> &mut #flattened_draft_ident<'b> {
+                    &mut self.#ident
+                }
 
-        let struct_field = format!("[`{struct_ident}::{ident}`]");
-        let commit_method = "[`Self::commit()`]".to_string();
-        let getter_doc = format!("Gets the value for {struct_field}.\n\nReturns a reference to the draft value if set, or falls through to the underlying struct's value.");
-        let setter_doc = format!("Set a draft value for {struct_field}.\n\nThis method does not overwrite the existing value in the underlying struct. To apply the change to the underlying struct, call {commit_method}.");
-        let dirty_doc = format!("Returns whether {struct_field} would be changed by this draft if {commit_method} was called.");
-        let reset_doc = format!("Clear any draft changes made to {struct_field}.");
+                pub fn #dirty_checker(&self) -> bool {
+                    self.#ident.is_dirty()
+                }
 
-        quote! {
-            #[doc = #getter_doc]
-            pub fn #getter(&self) -> &#ty {
-                match &self.#ident {
-                    ::cset::DraftField::Unchanged => &self.__backing.#ident,
-                    ::cset::DraftField::Changed(new_val) => &new_val,
+                pub fn #resetter(&mut self) {
+                    self.#ident.reset();
                 }
             }
-
-            #[doc = #setter_doc]
-            pub fn #setter(mut self, #ident: #ty) -> Self {
-                self.#ident = ::cset::DraftField::Changed(#ident);
-                self
-            }
-
-            #[doc = #dirty_doc]
-            pub fn #dirty_checker(&self) -> bool {
-                matches!(&self.#ident, ::cset::DraftField::Changed(_))
-            }
-
-            #[doc = #reset_doc]
-            pub fn #resetter(&mut self) -> Option<#ty> {
-                match ::std::mem::replace(&mut self.#ident, ::cset::DraftField::Unchanged) {
-                    ::cset::DraftField::Changed(new_value) => {
-                        Some(new_value)
+        } else {
+            let getter = format_ident!("get_{ident}");
+            let setter = format_ident!("set_{ident}");
+            quote! {
+                pub fn #getter(&self) -> &#ty {
+                    if let Some(#ident) = &self.#ident.draft {
+                        #ident
+                    } else {
+                        &self.#ident.original
                     }
-                    _ => None,
+                }
+
+                pub fn #setter(&mut self, #ident: #ty) {
+                    self.#ident.draft = Some(#ident);
+                }
+
+                pub fn #dirty_checker(&self) -> bool {
+                    self.#ident.draft.is_some()
+                }
+
+                pub fn #resetter(&mut self) -> Option<#ty> {
+                    self.#ident.draft.take()
                 }
             }
         }
     });
 
     let draft_change_checkers = fields.iter().map(|field| {
-        let UndoableStructField { ident, .. } = field;
+        let TrackedField { ident, .. } = field;
         let dirty_checker = create_dirty_check_ident(ident);
         quote!(self.#dirty_checker())
     });
 
     let draft_resetters = fields.iter().map(|field| {
-        let UndoableStructField { ident, .. } = field;
+        let TrackedField { ident, .. } = field;
         let resetter = create_resetter_ident(ident);
         quote!(self.#resetter())
     });
 
-    let draft_field_commit = fields.iter().map(|field| {
-        let UndoableStructField { id, ident, .. } = field;
+    let field_commits = fields.iter().map(|field| {
+        let TrackedField { index, ident, flattened_ident, .. } = field;
 
-        quote! {
-            if let ::cset::DraftField::Changed(#ident) = self.#ident {
-                let old_value = ::std::mem::replace(&mut self.__backing.#ident, #ident);
-
-                changes.push(::cset::Change::new(
-                    #id,
-                    Box::new(old_value),
-                ))
+        if flattened_ident.is_some() {
+            quote! {
+                {
+                    let new_field_idx = field_idx.push_field(#index);
+                    changes.push(::cset::Change {
+                        field_id: new_field_idx.clone(),
+                        value: ::cset::ChangeValue::ChangeSet(self.#ident.apply_impl(new_field_idx)),
+                    });
+                }
+            }
+        } else {   
+            quote! {
+                if let Some(change) = self.#ident.apply(field_idx.push_field(#index)) {
+                    changes.push(change);
+                }
             }
         }
     });
 
     quote! {
-        pub struct #draft_ident<'a> {
-            __backing: &'a mut #struct_ident,
+        pub struct #draft_ident<'b> {
             #(#draft_fields,)*
         }
 
-        impl<'a> #draft_ident<'a> {
-            #(#draft_field_fns)*
+        impl<'b> #draft_ident<'b> {
+            #(#field_api_fns)*
 
             /// Returns true if the draft will modify the underlying struct if
             /// committed.
@@ -210,18 +275,17 @@ fn create_draft_struct(struct_ident: &Ident, fields: &[UndoableStructField]) -> 
             pub fn reset(&mut self) {
                 #(#draft_resetters;)*
             }
-        }
 
-        impl<'a> Draft<'a> for #draft_ident<'a> {
-            fn commit(mut self) -> ChangeSet {
+            pub fn apply(self) -> ::cset::ChangeSet {
+                self.apply_impl(::cset::FieldId::default())
+            }
+    
+            fn apply_impl(self, field_idx: ::cset::FieldId) -> ::cset::ChangeSet {
                 let mut changes = Vec::new();
-
-                #(#draft_field_commit)*
-
-                ChangeSet::new(
-                    ::std::any::TypeId::of::<#struct_ident>(),
-                    changes
-                )
+    
+                #(#field_commits)*
+    
+                ::cset::ChangeSet::new::<#struct_ident>(changes)
             }
         }
     }
@@ -237,4 +301,24 @@ fn create_dirty_check_ident(ident: &Ident) -> Ident {
 
 fn create_resetter_ident(ident: &Ident) -> Ident {
     format_ident!("reset_{ident}")
+}
+
+fn get_meta_items(attr: &Attribute) -> syn::Result<Vec<NestedMeta>> {
+    if attr.path.is_ident("track") {
+        match attr.parse_meta()? {
+            Meta::List(meta) => Ok(Vec::from_iter(meta.nested)),
+            bad => Err(Error::new_spanned(bad, "unrecognized attribute")),
+        }
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn flattened_struct_ident(ty: &Type) -> Ident {
+    match ty {
+        Type::Path(path) => {
+            path.path.get_ident().unwrap().clone()
+        },
+        _ => todo!(),
+    }
 }

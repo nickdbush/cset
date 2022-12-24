@@ -2,10 +2,10 @@
 //!
 //! This crate offers a Track macro that structs can derive to generate the
 //! plumbing needed to precisely track changes to fields. Calling
-//! [`Trackable::edit()`] returns a [Draft] that stores edits separately from
+//! `edit()` returns a draft that stores edits separately from
 //! the underyling struct, such that no values are written.
 //!
-//! When [`Draft::commit()`] is called on the draft, edits are applied to the
+//! When `apply()` is called on the draft, edits are applied to the
 //! base struct. Each replaced value is returned to the caller as a [Change] in
 //! a [ChangeSet]. This changeset can then be re-applied to a struct of the same
 //! type, which replaces fields with values from the [ChangeSet]. This operation
@@ -15,118 +15,122 @@
 //! # Example
 //!
 //! ```
-//! use cset::{Track, Trackable, Draft};
+//! use cset::Track;
 //!
 //! #[derive(Track)]
+//! # #[derive(Debug, PartialEq)]
 //! struct Foo {
-//!     bar: i32,
+//!     x: usize,
+//!     #[track(flatten)]
+//!     bar: Bar,
 //! }
+//! # impl Foo {
+//! #     fn new(x: usize, bar: Bar) -> Self {
+//! #         Self { x, bar }
+//! #     }
+//! # }
 //!
-//! // Create a new `Foo` as normal
-//! let mut foo = Foo { bar: 0 };
+//! #[derive(Track)]
+//! # #[derive(Debug, PartialEq)]
+//! struct Bar {
+//!     y: usize,
+//! }
+//! # impl Bar {
+//! #     fn new(y: usize) -> Self {
+//! #         Self { y }
+//! #     }
+//! # }
 //!
-//! // Make a tracked change
-//! let undo_cset = foo.edit().set_bar(42).commit();
-//! assert_eq!(foo.bar, 42);
+//! let mut foo = Foo::new(10, Bar::new(42));
 //!
-//! // Undo the change by applying the returned changeset
-//! let redo_cset = foo.apply_changeset(undo_cset);
-//! assert_eq!(foo.bar, 0);
+//! // Enter the non-destructive editing mode
+//! let mut foo_draft = foo.edit();
+//! foo_draft.set_x(42);
+//! foo_draft.edit_bar().set_y(1024);
 //!
-//! // Redo the change by applying the changeset produced by undoing
-//! foo.apply_changeset(redo_cset);
-//! assert_eq!(foo.bar, 42);
+//! // Drop the draft to rollback, or apply the changes with `.apply()`
+//! let undo_changeset = foo_draft.apply();
+//! assert_eq!(foo, Foo::new(42, Bar::new(1024)));
+//!
+//! let redo_changeset = foo.apply(undo_changeset);
+//! assert_eq!(foo, Foo::new(10, Bar::new(42)));
+//!
+//! foo.apply(redo_changeset);
+//! assert_eq!(foo, Foo::new(42, Bar::new(1024)));
 //! ```
 
 use std::any::{Any, TypeId};
 
 pub use cset_derive::Track;
 
-/// Auto-implemented by the [Track] macro.
-pub trait Trackable<'a> {
-    type Draft: Draft<'a>;
-
-    fn edit(&'a mut self) -> Self::Draft;
-
-    fn apply_changeset(&mut self, changeset: ChangeSet) -> ChangeSet;
-}
-
-/// An interface for non-destructive and tracked changes to underlying data.
-///
-/// Four methods are generated for each field in the underlying [Trackable]
-/// struct (which produced this draft).
-///
-/// - `.get_{field}()` (gets the modified value, or the value from the
-///         underlying struct)
-/// - `.set_{field}(new_value: T)` (sets a new value for the field, obscuring
-///         the value from the underyling struct)
-/// - `.is_{field}_dirty() -> bool` (tests whether a new value has been set
-///         directly on this draft)
-/// - `.reset_{field}() -> Option<T>` (returns ownership of the value set on the
-///         draft if one exists)
-pub trait Draft<'a> {
-    /// Replaces values on the underyling [Trackable] struct with those from
-    /// this draft. Replaced values are returned in the [ChangeSet].
-    fn commit(self) -> ChangeSet;
-}
-
-/// Generic storage of values replaced by [`Draft::commit()`].
+#[derive(Debug)]
 pub struct ChangeSet {
-    target_type: TypeId,
-    changes: Vec<Change>,
+    pub target_type: TypeId,
+    pub changes: Vec<Change>,
 }
 
 impl ChangeSet {
-    pub const fn new(target_type: TypeId, changes: Vec<Change>) -> Self {
-        Self {
-            target_type,
+    pub fn new<T: 'static>(changes: Vec<Change>) -> Self {
+        ChangeSet {
+            target_type: TypeId::of::<T>(),
             changes,
         }
     }
 
-    /// The [TypeId] of the struct that this [ChangeSet] relates to.
-    ///
-    /// [`Trackable::apply_changeset()`] panics when called with a changeset
-    /// produced for another [Trackable] struct.
-    pub const fn target_type(&self) -> TypeId {
-        self.target_type
-    }
-
-    pub fn changes(&self) -> &[Change] {
-        &self.changes
-    }
-
-    pub fn take_changes(self) -> Vec<Change> {
-        self.changes
+    pub fn for_type<T: 'static>(&self) -> bool {
+        self.target_type == TypeId::of::<T>()
     }
 }
 
-/// A change to one field of a [Trackable] struct.
+#[derive(Debug)]
+pub enum ChangeValue {
+    Value(Box<dyn Any>),
+    ChangeSet(ChangeSet),
+}
+
+#[derive(Debug)]
 pub struct Change {
-    field: &'static str,
-    old_value: Box<dyn Any>,
+    pub field_id: FieldId,
+    pub value: ChangeValue,
 }
 
-impl Change {
-    pub const fn new(field: &'static str, old_value: Box<dyn Any>) -> Self {
-        Self { field, old_value }
+#[derive(Debug)]
+pub struct DraftField<'b, T: 'static> {
+    pub original: &'b mut T,
+    pub draft: Option<T>,
+}
+
+impl<'b, T> DraftField<'b, T> {
+    pub fn new(original: &'b mut T) -> Self {
+        Self {
+            original,
+            draft: None,
+        }
     }
 
-    pub const fn field(&self) -> &str {
-        self.field
-    }
-
-    pub fn take_old_value(self) -> Box<dyn Any> {
-        self.old_value
+    pub fn apply(self, field_idx: FieldId) -> Option<Change> {
+        self.draft.map(|new_value| {
+            let old_value = std::mem::replace(self.original, new_value);
+            let boxed: Box<dyn Any> = Box::new(old_value);
+            Change {
+                field_id: field_idx,
+                value: ChangeValue::Value(boxed),
+            }
+        })
     }
 }
 
-/// Tracks whether the fields of a [Draft] have been modified.
-pub enum DraftField<T> {
-    /// The value of the underlying base struct has not changed.
-    Unchanged,
-    /// The value of the underyling base struct has been changed. If the
-    /// transaction is committed, the old value will be returned to the caller
-    /// as part of the [ChangeSet].
-    Changed(T),
+#[derive(Debug, Clone, Default)]
+pub struct FieldId(Vec<usize>);
+
+impl FieldId {
+    pub fn push_field(&self, child_field: usize) -> Self {
+        let mut new = self.clone();
+        new.0.push(child_field);
+        new
+    }
+
+    pub fn field_index(&self, depth: usize) -> usize {
+        self.0[depth]
+    }
 }
